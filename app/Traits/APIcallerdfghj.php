@@ -8,7 +8,7 @@ trait APICaller
 
     public static function urlRequest()
     {
-        APICaller::$baseURL = env('JED_BASE_URL');
+        APICaller::$baseURL = env('BASE_URL');
 
         APICaller::$urlSet = [
             "balance" => [
@@ -61,7 +61,7 @@ trait APICaller
             CURLOPT_MAXREDIRS => 10,
             CURLOPT_SSL_VERIFYHOST => 0,
             CURLOPT_SSL_VERIFYPEER => 0,
-            CURLOPT_TIMEOUT => 0,
+            CURLOPT_TIMEOUT => 60,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
             CURLOPT_CUSTOMREQUEST => "GET",
@@ -110,7 +110,7 @@ trait APICaller
             CURLOPT_CUSTOMREQUEST => "POST",
             CURLOPT_POSTFIELDS => json_encode($data),
             CURLOPT_HTTPHEADER => [
-                "Authorization:" . APICaller::$auth,
+                // "Authorization:" . APICaller::$auth,
                 "Content-Type: application/json",
                 "Postman-Token: e1ab5b69-217f-4404-9375-eebe2094fc13",
                 "cache-control: no-cache"

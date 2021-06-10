@@ -2,51 +2,58 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\OldPowerTransaction;
+use App\Models\PowerProvider;
 use App\Models\PowerTransaction;
-use App\Services\APICaller;
-use App\Services\HistoryService;
-use App\Services\ResponseFormats;
-use App\Services\ResponseService;
-use App\Services\TestFile;
-use App\Services\Validations;
+use App\Traits\APIcalls;
+use App\Traits\Histories;
+use App\Traits\HttpCaller;
+use App\Traits\Response;
+use App\Traits\Validations;
+use Carbon\Carbon;
 use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Collection;
 
 class PowerController extends Controller
 {
-	use APICaller, Validations, ResponseFormats, ResponseService, HistoryService;
-	// use TestFile, Validations, ResponseFormats, ResponseService, HistoryService;
-	private $jos_elec, $admin;
+	use HttpCaller;
 
-	public function __construct(CommonController $relatedCtrl, AdminController $admin)
+	private $project, $project_donation, $payment;
+
+	public function getProviders()
 	{
-		$this->admin = $admin;
-		$this->jos_elec = $relatedCtrl;
+		$params = [
+			'response_format' => 'json'
+		];
+
+		try {
+			$response = self::get_disco(['irechargePowerDisco'], $params);
+			// Log::info($response);
+		} catch (Exception $e) {
+			return response()->json($e->getMessage());
+		}
+		$data = collect($response['bundles']);
+
+		foreach ($data as $datum) {
+			// dd($datum);
+			$save = new PowerProvider([
+				'name' => $datum['description'],
+				'code' => $datum['code'],
+				'min_purchase' => $datum['minimum_value'],
+				'max_purchase' => $datum['maximum_value'],
+				'created_at' => Carbon::now(),
+				'updated_at' => Carbon::now()
+			]);
+
+			// dd($save);
+			$save->save();
+		}
+
+		$providers = PowerProvider::all();
+		return response()->json(['code' => '00', 'message' => 'providers fetched successfully', 'providers' => $providers]);
 	}
 
-	private function create(Request $request): PowerTransaction
-	{
-		$newTransaction = new PowerTransaction([
-			"trace_id" 			=> $request->trace_id,
-			"transaction_id" 	=> time() . rand(100, 1000),
-			"phone_number" 		=> $request->phone_number,
-			"meter_type" 		=> $request->meter_type,
-			"disco" 			=> $request->disco,
-			"meter_number" 		=> $request->meter_number,
-			"amount" 			=> $request->amount,
-			"email" 			=> $request->email,
-			"status" 			=> 'incomplete',
-			"request_time" 		=> date('D jS M Y, h:i:sA'),
-			"client_request" 	=> json_encode($request->all()),
-			"date"				=> date('D jS M Y, h:i:sa')
-		]);
-
-		$newTransaction->save();
-
-		return $newTransaction;
-	}
 
 	private function update($values, $transactionId)
 	{
@@ -59,288 +66,262 @@ class PowerController extends Controller
 		$transaction->update();
 	}
 
-	public function start(Request $request)
+
+	private function store(Request $request): PowerTransaction
 	{
-		$isErrored =  self::validateRequest($request, self::$PowerValidationRule);
+		$newTransaction = new PowerTransaction([
+			"ip"					=> $_SERVER['REMOTE_ADDR'],
+			"transaction_id"        => $request->transaction_id,
+			"phone_number"          => $request->phone_number,
+			"customer_name"         => $request->customer_name,
+			"disco_id"              => $request->disco_id,
+			"access_token"          => $request->access_token,
+			"meter_number"          => $request->meter_no,
+			"amount"                => $request->amount,
+			"payment_method"		=> $request->payment_method,
+			"recipient_name"        => $request->recipient_name,
+			"recipient_address"     => $request->recipient_address,
+			"status"                => 'incomplete',
+			"request_time"          => $request->request_time,
+			"response_time"         => $request->response_time,
+			"client_verify_request" => json_encode($request->all()),
+			"api_verify_request"        => $request->api_verify_request,
+			"api_verify_response"       => $request->api_verify_response,
+			"client_verify_response"    => $request->client_verify_response,
+		]);
+
+		$newTransaction->save();
+
+		return $newTransaction;
+	}
+
+
+	public function create(Request $request)
+	{
+		$isErrored =  self::validateRequest($request, self::$PowerValidation);
+
 		if ($isErrored) return self::returnFailed($isErrored);
 
-		// $provider = $this->commonCtrl::getOneBackupValue($this->commonCtrl::ELECTRICITY_PROVIDER, "shortname", $request->disco);
-		// if ($provider == null) return self::returnNotFound("Please provide valid provider");
+		if (!(self::validate_passcode($request->passcode, $request->phone_number))) return self::returnFailed("invalid passcode");
 
-		$transaction = $this->create($request);
+		$transaction_id = date(time() . rand(11, 99));
 
-		$apiVerificationRequest = [
-			"vreg" 		=> $transaction->transaction_id,
-			"meter" 	=> $transaction->meter_number,
-			"amount" 	=> $transaction->amount,
+		$disco = PowerProvider::find($request->disco_id);
+
+		if ($request->amount < $disco->min_vend) return self::returnFailed("minimum power purchase is " . $disco->min_vend);
+		if ($request->amount > $disco->max_vend) return self::returnFailed("maximum power purchase is " . $disco->max_vend);
+
+		$combined_string = env("IRECHARGE_VENDOR_ID") . "|" . $transaction_id . "|" . $request->meter_no . "|" . $disco->code . "|" . env("IRECHARGE_PUB_KEY");
+
+		$hash = self::hashString($combined_string, env("IRECHARGE_PRIV_KEY"));
+
+		$params = [
+			"vendor_code"		=> env('IRECHARGE_VENDOR_ID'),
+			"reference_id"		=> $transaction_id,
+			"meter"		        => $request->meter_no,
+			"disco"		        => $disco->code,
+			"response_format"   => "json",
+			"hash"				=> $hash,
 		];
 
 		try {
-			if ($transaction->meter_type === "prepaid") {
-				$apiVerificationResponse = self::get(["verify", "prepaid"], $apiVerificationRequest);
-			} else {
-				$apiVerificationResponse = self::post(["verify", "postpaid"], $apiVerificationRequest);
-			}
-
-			// if ($transaction->meter_type === "prepaid") {
-			// 	$apiVerificationResponse = TestFile::verifyPrepaid(["verify", "prepaid"], $apiVerificationRequest);
-			// } else {
-			// 	$apiVerificationResponse = TestFile::verifyPostpaid(["verify", "postpaid"], $apiVerificationRequest);
-			// }
-
-			Log::info("\n\nRESPONSE FROM 3RD PARTY on validation of meter");
-			Log::info("METHOD NAME: `start()`");
-			Log::info(json_encode($apiVerificationResponse));
+			$apiVerifyMeter = self::get(["irechargeVerifyMeter"], $params);
+			Log::info("\n\nRESPONSE FROM 3RD PARTY on vend");
+			Log::info(json_encode($apiVerifyMeter));
 		} catch (Exception $e) {
 			Log::error($e);
 			return self::returnFailed($e->getMessage());
 		}
 
-		if ($apiVerificationResponse != null) {
-			if (isset($apiVerificationResponse->code)) {
-				if ($apiVerificationResponse->code != "100") return self::returnFailed();
+		if ($apiVerifyMeter != null) {
+			if (isset($apiVerifyMeter->status)) {
+				if ($apiVerifyMeter->status !== "00") return self::returnFailed("");
 
-				if (isset($apiVerificationResponse->client)) {
-					$customer_name = $apiVerificationResponse->client->meter_name;
-					$customer_address = $apiVerificationResponse->client->meter_address;
-				} else {
-					$customer_name = $apiVerificationResponse->name;
-					$customer_address = $apiVerificationResponse->address . ", " . $apiVerificationResponse->state;
-				}
+				$recipient_name = $apiVerifyMeter->customer->name;
+				$recipient_address = $apiVerifyMeter->customer->address;
+				$access_token = $apiVerifyMeter->access_token;
 
-				$clientResponse = [
-					"customer_name" 	=> $customer_name,
-					"phone" 			=> $transaction->phone_number,
-					"meter_number" 		=> $transaction->meter_number,
-					"meter_type" 		=> $transaction->meter_type,
-					"customer_address" 	=> $transaction->customer_address,
-					"amount" 			=> $transaction->amount,
-					"provider" 			=> $transaction->disco,
-					"transaction_id" 	=> $transaction->transaction_id,
-					"email" 			=> $transaction->email,
-					"requested_at" 		=> $transaction->request_time,
-					"status" 			=> $transaction->status,
-					"date" 				=> $transaction->date
+				$response = [
+					"recipient_name" 	=> $recipient_name,
+					"recipient_address" => $recipient_address,
+					"phone" 			=> $request->phone_number,
+					"meter_number" 		=> $request->meter_no,
+					"amount" 			=> $request->amount + $disco->service_charge,
+					"provider" 			=> $disco->name,
+					"transaction_id" 	=> $transaction_id,
+					"requested_at" 		=> $request_time = date('D jS M Y, h:i:sA'),
+					"responded_at"      => $response_time = date('D jS M Y, h:i:sa'),
 				];
 
-				$dataToUpdate = [
-					"customer_name" 	=> $customer_name,
-					"customer_address" 	=> $customer_address ?? `N/A`,
-					"api_response" 		=> json_encode($apiVerificationResponse),
-					"api_request" 		=> json_encode($apiVerificationRequest),
-					"client_response" 	=> json_encode($clientResponse),
-					"response_time" 	=> date('D jS M Y, h:i:sa'),
-				];
+				$request->merge([
+					"amount"					=> $request->amount,
+					"transaction_id"			=> $transaction_id,
+					"access_token"              => $access_token,
+					"recipient_name"            => $recipient_name,
+					"recipient_address"         => $recipient_address,
+					"api_verify_request"        => json_encode($params),
+					"api_verify_response"       => json_encode($apiVerifyMeter),
+					"client_verify_response"    => json_encode($response),
+					"request_time"              => $request_time,
+					"response_time"             => $response_time,
+				]);
 
-				$this->update($dataToUpdate, $transaction->id);
-				return self::returnSuccess(self::ResponseThirdParty($clientResponse, "power", "create"));
+				$this->store($request);
+
+				return self::returnSuccess($response);
 			}
 		}
-		Log::error("\n\ERROR ON VERIFYING METER NUMBER");
+
+		Log::error("\n\nERROR ON VERIFYING METER NUMBER");
 		Log::error("METHOD NAME: `start()`");
-		return self::returnFailed("sorry, service currently unavailable");
+		return Response::returnFailed("sorry, service currently unavailable");
 	}
 
 
-	public function vend(Request $request)
+
+	public function purchase(Request $request)
 	{
-		$vendRequestTime = date('D jS M Y, h:i:sa');
-		$isErrored =  self::validateRequest($request, self::$PrepaidVendValidationRule);
+		$requestTime = date('D jS M Y, h:i:sa');
+
+		$isErrored =  self::validateRequest($request, self::$VendValidation);
 
 		if ($isErrored) return self::returnFailed($isErrored);
 
-		$transaction = $this->jos_elec::getOneBackupValue($this->jos_elec::POWER_TRANSACTION['NEW'], "transaction_id", $request->transaction_id);
+		if (!(self::validate_passcode($request->passcode, $request->transaction_id))) return self::returnFailed("invalid passcode");
 
-		if ($transaction == null) return self::returnNotFound("Please provide valid transaction id");
+		$transaction = PowerTransaction::where("transaction_id", $request->transaction_id)->first();
 
-		$apiVendRequest = [
-			"amount" 	=> $transaction->amount,
-			"vref" 		=> $transaction->transaction_id,
-			"wallet_id" => "2DD0D82009D1320781B2D5320",
-			"agent_id" 	=> "IFSR_INFOSTRATE",
-			"mobile" 	=> $transaction->phone_number,
-		];
-		if ($transaction->type === "postpaid") {
-			$apiVendRequest["account_no"] = $transaction->meter_number;
-			$apiVendRequest["posted_on"] = time();
-		}
-		$apiVendRequest["meter"] = $transaction->meter_number;
+		if ($transaction == null) return self::returnNotFound("transaction does not exist");
+		if ($transaction->status === "fulfilled") return self::returnFailed("transaction already completed");
+
+		$combined_string = env("IRECHARGE_VENDOR_ID") . "|" . $transaction->transaction_id . "|" . $transaction->meter_number . "|" . $transaction->provider->code . "|" . $transaction->amount . "|" . $transaction->access_token . "|" . env("IRECHARGE_PUB_KEY");
+
+		$hash = self::hashString($combined_string, env("IRECHARGE_PRIV_KEY"));
+
+		// AT THIS POINT, THE WALLET BALANCE IS CHECKED TO ENSURE THERE IS SUFFICIENT FUND
+		// $balance = $this->payment::getBalance($transaction->amount);
+		// if($balance < $transaction->amount) return self::returnFailed("opps! please try again");
 
 
-		try {
-			if ($transaction->meter_type === "prepaid") {
-				$apiVendResponse = self::post(["vend", "prepaid"], $apiVendRequest);
-			} else {
-				$apiVendResponse = self::post(["vend", "postpaid"], $apiVendRequest);
+		$data = array(
+			"txref"	=> $request->payment_ref,
+			"SECKEY" => env("RAVE_SECRET_TEST")
+		);
+
+		$validate_payment = self::verify_payment($data);
+
+		if ($validate_payment != null) {
+			if (isset($validate_payment->status) && $validate_payment->status == 'success') {
+				if ($validate_payment->data->status == "successful") {
+
+					$amount = $transaction->amount + $charge = $transaction->provider->service_charge;
+					if ($validate_payment->data->amount == $amount) {
+
+						$success = $this->payment->createPayment(json_encode($data), $transaction->transaction_id, $request->payment_ref, $requestTime, "Power", json_encode($validate_payment));
+
+						if ($success == false) return self::returnFailed("oops! duplicate payment.");
+
+						$params = [
+							"vendor_code"		=> env('IRECHARGE_VENDOR_ID'),
+							"meter"		        => $transaction->meter_number,
+							"reference_id"		=> $transaction->transaction_id,
+							"disco"			    => $transaction->provider->code,
+							"access_token"		=> $transaction->access_token,
+							"amount"            => $transaction->amount,
+							"phone"             => $transaction->phone_number,
+							"email"				=> env('VENDCARE_MAIL'),
+							"hash"				=> $hash,
+							"response_format"   => "json",
+						];
+
+						try {
+							$apiVendResponse = self::get(["irechargeVendPower"], $params);
+							Log::info("\n\nRESPONSE FROM 3RD PARTY on vend");
+							Log::info(json_encode($apiVendResponse));
+						} catch (Exception $e) {
+							Log::error($e);
+							return self::returnFailed($e->getMessage());
+						}
+
+						if ($apiVendResponse != null) {
+							if (isset($apiVendResponse->status)) {
+								if ($apiVendResponse->status !== "00") return self::returnFailed("oops! something went wrong, try again");
+
+								$status = $apiVendResponse->status === "00" ? "fulfilled" : "pending";
+
+								if ($status == 'fulfilled') $this->payment->resetBalance($amount);
+
+								$units = $apiVendResponse->units;
+								$token = $apiVendResponse->meter_token;
+
+								$response = [
+									"payment_reference"	    => $request->payment_ref,
+									"transaction_id"	    => $transaction->transaction_id,
+									"phone_number"          => $transaction->phone_number,
+									"disco"			        => $transaction->provider->name,
+									"meter_number"          => $transaction->meter_number,
+									"recipient_name"        => $transaction->recipient_name,
+									"recipient_address"     => $transaction->recipient_address,
+									"amount"				=> $amount,
+									"status"			    => $status,
+									"token"			        => $token,
+									"units"			        => $units,
+									"requested_at"		    => $requestTime,
+									"responded_at"          => $response_time = date('D jS M Y, h:i:sa'),
+								];
+
+								$updateData = [
+									"status"				=> $status,
+									"token"				    => $token,
+									"units"				    => $units,
+									"payment_reference"	    => $request->payment_ref,
+									"api_vend_request"		=> json_encode($params),
+									"api_vend_response"		=> json_encode($apiVendResponse),
+									"client_vend_response"	=> json_encode($response),
+									"client_vend_request"	=> json_encode($request->all()),
+									"request_time"		    => $requestTime,
+									"response_time"		    => $response_time,
+								];
+
+								$this->update($updateData, $transaction->id);
+
+								$gross_income = ($transaction->amount * $transaction->provider->commission);
+
+								$expenses = env("RAVE_CHARGE") + ($transaction->amount * env("RAVE_COMMISSION"));
+
+								$net_income = $charge + $gross_income - $expenses;
+
+								$project = $this->project_donation->calculate_donation($net_income, $transaction->transaction_id, $transaction->customer_name);
+								$response["message"] = "Thanks for donating the sum of NGN" . (float)$net_income . " towards " . $project;
+
+								return self::returnSuccess($response);
+							}
+						}
+
+						Log::error("\n\nERROR ON VENDING DATA");
+						Log::error("METHOD NAME: `vend()`");
+						return self::returnFailed("sorry, service currently unavailable");
+					}
+					return self::returnFailed("amount paid does not match amount entered");
+				}
+				return self::returnFailed("error occured while validating payment");
 			}
-
-			// if ($transaction->meter_type === "prepaid") {
-			// 	$apiVendResponse = TestFile::vendPrepaid(["vend", "prepaid"], $apiVendRequest);
-			// } else {
-			// 	$apiVendResponse = TestFile::vendPostpaid(["vend", "postpaid"], $apiVendRequest);
-			// }
-
-			Log::info("RESPONSE FROM 3RD PARTY on vend()");
-			Log::info(json_encode($apiVendResponse));
-		} catch (Exception $e) {
-			return self::returnFailed($e->getMessage());
-			Log::error($e);
+			return self::returnFailed("error processing payment");
 		}
 
-		if ($apiVendResponse != null) {
-			if (isset($apiVendResponse->code)) {
-				// if ($apiVendResponse->code === "014") return self::returnFailed("Transaction is already completed");
-				if ($apiVendResponse->code !== "100") return self::returnFailed();
-
-				$status = $apiVendResponse->code == "100" ? "fulfilled" : "pending";
-
-				if ($status == 'fulfilled') $this->admin->resetBalance($transaction->amount);
-
-				$clientVendResponse = [
-					"phone" 			=> $transaction->phone_number,
-					"amount"			=> $transaction->amount,
-					"email"				=> $transaction->email,
-					"transaction_id"	=> $transaction->transaction_id,
-					"requested_at"		=> $transaction->request_time,
-					"status"			=> $status,
-					"payment_reference" => $request->payment_reference,
-					"address" 			=> $transaction->customer_address,
-					"token" 			=> $token = $apiVendResponse->token->pin ?? `N/A`,
-					"units" 			=> $units = $apiVendResponse->token->units ?? `N/A`,
-					"payment_reference" => $request->payment_reference,
-					"date" 				=> $date = date('D jS M Y, h:i:sa'),
-					"receiver" 			=> $transaction->meter_number,
-					"customer_name"		=> $transaction->customer_name,
-					"provider"			=> $transaction->disco,
-				];
-
-				$dataToUpdate = [
-					"payment_reference" 	=> $request->payment_reference,
-					"payment_reference" 	=> $request->payment_reference,
-					"payment_reference" 	=> $request->payment_reference,
-					"client_vend_request" 	=> json_encode($request->all()),
-					"client_vend_response" 	=> json_encode($clientVendResponse),
-					"api_vend_request" 		=> json_encode($apiVendRequest),
-					"api_vend_response" 	=> json_encode($apiVendResponse),
-					"vend_request_time" 	=> $vendRequestTime,
-					"status" 				=> $status,
-					"token" 				=> $token,
-					"units" 				=> $units,
-					"date" 					=> $date,
-					"vend_response_time" 	=> date('D jS M Y, h:i:sa'),
-				];
-
-				$this->update($dataToUpdate, $transaction->id);
-				return self::returnSuccess(self::ResponseThirdParty($clientVendResponse, "power", "vend"));
-			}
-		}
-
-		Log::error("\n\ERROR ON VENDING POWER");
+		Log::error("\n\nERROR ON VENDING DATA");
 		Log::error("METHOD NAME: `vend()`");
 		return self::returnFailed("sorry, service currently unavailable");
 	}
 
 
-
-	public function history(Request $request)
+	public function getHistories(Request $request)
 	{
-		$isErrored =  self::validateRequest($request, self::$TransactionHistoryValidationRule);
+		$isErrored =  self::validateRequest($request, self::$GetHistories);
 		if ($isErrored) return self::returnFailed($isErrored);
-
-		$historyData = HistoryService::fetchHistory(new PowerTransaction(), new OldPowerTransaction(), $request->all(), $request->page);
-
-		return self::returnSuccess($historyData);
-	}
-
-
-
-	public function status($transaction_id)
-	{
-		$transaction = $this->jos_elec::getOneBackupValue($this->jos_elec::POWER_TRANSACTION['NEW'], "transaction_id", $transaction_id);
-
-		if ($transaction == null) return self::returnNotFound("Please provide valid transaction id");
-
-
-		try {
-			if ($transaction->meter_type == "prepaid") {
-				$apiStatusResponse = self::get(["status", "prepaid"], $transaction_id);
-			} else {
-				$apiStatusResponse = self::get(["status", "postpaid"], $transaction_id);
-			}
-
-			// if ($transaction->meter_type == "prepaid") {
-			// 	$apiStatusResponse = TestFile::vendPrepaid(["status", "prepaid"], $transaction_id);
-
-			// } else {
-			// 	$apiStatusResponse = TestFile::vendPostpaid(["status", "postpaid"], $transaction_id);
-			// }
-			Log::info("RESPONSE FROM 3RD PARTY on vend()");
-			Log::info(json_encode($apiStatusResponse));
-		} catch (Exception $e) {
-			return self::returnFailed($e->getMessage());
-			Log::error($e);
-		}
-
-		if ($apiStatusResponse != null) {
-			if (isset($apiStatusResponse->code)) {
-				if ($apiStatusResponse->code != "100") return self::returnFailed("Invalid Transaction id");
-
-				if (isset($apiStatusResponse->data)) {
-					$apiQuery =  [
-						"Transaction Date" => $apiStatusResponse->data->timestamp,
-						"receipt no" => $apiStatusResponse->data->receipt_no,
-						"meter number" => $apiStatusResponse->data->account_no,
-						"amount" => $apiStatusResponse->data->amount,
-					];
-				} else {
-					$apiQuery =  [
-						"Token" => $apiStatusResponse->token->pin,
-						"Units" => $apiStatusResponse->token->units,
-						"Status" => $apiStatusResponse->message,
-						"purchased at" => $apiStatusResponse->vend_time,
-						"credited at" => $apiStatusResponse->time,
-					];
-				}
-				return self::returnSuccess($apiQuery);
-			}
-		}
-
-		Log::error("\n\ERROR ON VENDING POWER");
-		Log::error("METHOD NAME: `vend()`");
-		return self::returnFailed("sorry, service currently unavailable");
-	}
-
-	public function changeToken($apiTokenResponse)
-	{
-		try {
-			$apiTokenResponse = self::get(["get-token", "attach"], $apiTokenResponse);
-			// $apiTokenResponse = TestFile::token(["get-token", "attach"], $apiTokenResponse);
-			Log::info("RESPONSE FROM 3RD PARTY on vend()");
-			Log::info(json_encode($apiTokenResponse));
-		} catch (Exception $e) {
-			return self::returnFailed($e->getMessage());
-			Log::error($e);
-		}
-
-
-		if ($apiTokenResponse != null) {
-			if (isset($apiTokenResponse->code)) {
-				if ($apiTokenResponse->code == "601") return self::returnFailed("No Key Change Tokens where found");
-
-				if ($apiTokenResponse->first_code != null && $apiTokenResponse->second_code != null) {
-					$token =  [
-						"first_code" => $apiTokenResponse->first_code,
-						"second_code" => $apiTokenResponse->second_code,
-						"time" => $apiTokenResponse->time
-					];
-				}
-
-				return self::returnSuccess($token);
-			}
-		}
-
-		Log::error("\n\ERROR");
-		Log::error("METHOD NAME: `changeToken()`");
-		return self::returnFailed("sorry, service currently unavailable");
+		$history = PowerTransaction::query();
+		$response = self::transactionHistories($request, $history);
+		$history = $response->latest()->paginate(10);
+		return self::returnSuccess($history);
 	}
 }
